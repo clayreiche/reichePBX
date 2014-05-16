@@ -68,14 +68,15 @@ function forwardOutOfDialogRequest(rq, flow) {
       rq.headers['record-route'] = [{uri: flow_uri}].concat(c[0].route, rq.headers['record-route'] || []);
     }
     proxy.send(rq);
-  }
-  else
+  } else {
 	if(rq.method === "NOTIFY") {
 		proxy.send(sip.makeResponse(rq, 200, 'OK'));
-		console.log(bindings);
+		//console.log(bindings);
 	}else {
 		proxy.send(sip.makeResponse(rq, 404, 'Not Found'));
 	}
+  }
+  console.log("OUTOFDIALOG: \n" + bindings);
 }
 
 function forwardInDialogRequest(rq, flow) {
@@ -84,7 +85,7 @@ function forwardInDialogRequest(rq, flow) {
     if(rq.headers.route[0].hostname == furi.hostname && rq.headers.route[0].user == furi.user)
       rq.headers.route.shift();
   }
-
+  console.log("INDIALOG: \n" + bindings);
   proxy.send(rq);
 }
 
