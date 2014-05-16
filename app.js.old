@@ -1,0 +1,166 @@
+
+/**
+ * Module dependencies.
+ */
+
+var express = require('express');
+var routes = require('./routes');
+var user = require('./routes/user');
+var http = require('http');
+var path = require('path');
+
+
+// SIP STUFF
+var sip = require('sip');
+var proxy = require('sip/proxy');
+var net = require('net');
+var crypto = require('crypto');
+var sys = require('sys');
+var util = require('sys');
+var redis = require('redis');
+var client = redis.createClient(6379, 'localhost', {no_ready_check: true});
+
+
+
+var app = express();
+
+// all environments
+app.set('port', process.env.PORT || 3000);
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'jade');
+app.use(express.favicon());
+app.use(express.logger('dev'));
+app.use(express.json());
+app.use(express.urlencoded());
+app.use(express.methodOverride());
+app.use(app.router);
+app.use(express.static(path.join(__dirname, 'public')));
+
+// development only
+if ('development' == app.get('env')) {
+  app.use(express.errorHandler());
+}
+
+app.get('/', routes.index);
+app.get('/users', user.list);
+
+http.createServer(app).listen(app.get('port'), function(){
+  console.log('Express server listening on port ' + app.get('port'));
+});
+
+
+
+// SIP STUFF
+var context = 'default'; //this will be dynamic based on sip user
+var contacts = {};
+
+
+function trim(str) {
+	return str.replace(/^\s+|\s+$/g, '');
+}
+
+proxy.start({
+	logger: {
+		recv: function(m) { util.debug('recv:' + util.inspect(m, null, null)); },
+		send: function(m) { util.debug('send:' + util.inspect(m, null, null)); },
+		error: function(e) { util.debug(e.stack); }
+	  }
+  },function(request, flow) {
+ 
+	try {
+		console.log(flow);
+ 
+		// Parse the URI in the reuqest header.
+		var address = sip.parseUri(request.headers.to.uri);
+ 		
+ 
+		// Handle SIP Registrations.
+		if (trim(request.method) == 'REGISTER') {
+			onRegister(request, flow); 
+		} else {
+			if(!request.headers.to.params.tag) {
+				forwardOutOfDialogRequest(request, flow);
+			} else {
+			  forwardInDialogRequest(request, flow);
+			}
+		}		
+	}
+	// Handle exceptions.	
+	catch (e) {
+		proxy.send(sip.makeResponse(request, 500, 'Internal Server Error'));
+		sys.debug('Exception ' + e + ' at ' + e.stack);
+		// Close the Redis client
+		client.quit();
+	}	
+	
+});
+
+function onRegister(request, flow) {
+	var contact = request.headers.contact;
+	var address = sip.parseUri(request.headers.to.uri);
+	// Store the registration info.
+	if (Array.isArray(contact)
+			&& contact.length
+			&& (+(contact[0].params.expires
+					|| request.headers.expires || 300)) > 0) {
+		client.set("registration_" + context + "_" + address.user, JSON.stringify(request));
+	}
+
+	// Remove the registration info.
+	else {
+		client.del("registration_" + context + "_" + address.user);
+	}
+
+	// Build the response.
+	var response = sip.makeResponse(request, 200, 'OK');
+
+	// Send the response to the SIP client
+	proxy.send(response);
+		
+	// Close the Redis client
+	client.quit();
+}
+
+function forwardOutOfDialogRequest(request, flow) {
+	request.headers.to.params.tag = crypto.randomBytes(8).toString('hex');
+	if (trim(request.method) == 'INVITE') {
+		proxy.send(sip.makeResponse(request, 100, 'Trying'));
+	}
+	var address = sip.parseUri(request.uri);
+	var flow_uri = {schema: flow.protocol === 'TLS' ? 'sips' : 'sip', user: encodeFlowToken(flow), host: hostname, params:{}};
+	client.get("registration_" + context + "_" + address.user, function(err, register_data) {
+		var register_data = JSON.parse(register_data);
+		console.log(register_data);
+		if(register_data === null) {
+			proxy.send(sip.makeResponse(request, 404, 'Not Found'));
+		} else {
+			console.log(register_data);
+			request.uri = register_data.headers.contact[0].uri;			
+			flow_uri.params.lr = null;
+			request.headers.route = register_data.headers.contact[0].route.concat(request.headers.route || []);
+			console.log(request.headers.route);
+			request.headers['record-route'] = [{uri: flow_uri}].concat(register_data.headers.contact[0].route, request.headers['record-route'] || []);
+			proxy.send(request);
+		}		
+	});	
+	
+	// Close the Redis client
+	client.quit();
+}
+
+function forwardInDialogRequest(request, flow) {
+  if(request.headers.route) {
+	var furi = {schema: flow.protocol === 'TLS' ? 'sips' : 'sip', user: encodeFlowToken(flow), host: hostname, params:{}};
+	if(request.headers.route[0].hostname == furi.hostname && request.headers.route[0].user == furi.user)
+	  request.headers.route.shift();
+  }
+
+  proxy.send(request);
+}
+
+function encodeFlowToken(flow) {
+	var s = [flow.protocol, flow.address, flow.port, flow.local.address, flow.local.port].join();
+	var h = crypto.createHmac('sha1', rbytes);
+	h.update(s);
+	return toBase64([h.digest('base64'), s].join());
+}
